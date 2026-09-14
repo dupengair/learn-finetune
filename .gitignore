@@ -1,0 +1,31 @@
+# ===== 模型权重（本地下载，不进 git，约 5G）=====
+model/
+
+# ===== 数据集原始数据与缓存（不进 git）=====
+# zhihu-kol：原始 parquet 1.4G + 分词缓存 53G（保留 README 数据卡片）
+datasets/zhihu-kol/*
+!datasets/zhihu-kol/README.md
+# GLUE：各子集原始数据 161M + 分词缓存（保留 README）
+datasets/glue/*
+!datasets/glue/README.md
+# HuggingFace 下载缓存
+datasets/.cache/
+
+# ===== 训练产物 =====
+# checkpoint、TensorBoard 日志与 lora_adapter/ 均不进 git（体积大或可再生）
+training/*
+
+# ===== 临时产物 =====
+tmp_trainer/
+
+# ===== CodeGraph 本地索引 =====
+.codegraph/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
