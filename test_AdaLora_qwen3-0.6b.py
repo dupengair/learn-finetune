@@ -1,5 +1,6 @@
 from peft import (
-    LoraConfig,
+    # LoraConfig,
+    AdaLoraConfig,
     TaskType,
     get_peft_model,
     PeftModel,        # 新增：加载已保存的适配器
@@ -10,8 +11,10 @@ from transformers import (
     AutoTokenizer,
     # DataCollatorForLanguageModeling,
     TrainingArguments,
-    Trainer
+    Trainer,
+    TrainerCallback
 )
+
 from datasets import load_dataset, DatasetDict
 # from typing import List, Dict
 import evaluate as ev
@@ -92,7 +95,7 @@ def tokenize_func(example):
         full_texts.append(full_str)
         user_parts.append(user_str)
 
-    # 对完整文本做tokenize，得到input_ids、attention_mask；不 padding（padding 由 collator 动态做）
+    # 对完整文本做tokenize，得到input_ids、attention_mask；固定长度1024
     tokenized_full = tokenizer(
         full_texts,
         truncation=True,
@@ -145,20 +148,24 @@ print("分词后数据集：", tokenized_datasets)
 
 
 # ===================== 加载 =====================
-lora_save_path = "./training/qwen3-0.6b_Lora/lora_adapter"   # ← 从文件末尾上移到此处定义
+lora_save_path = "./training/qwen3-0.6b_AdaLora/lora_adapter"   # ← 从文件末尾上移到此处定义
 # 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
 has_adapter = os.path.exists(os.path.join(lora_save_path, "adapter_config.json"))
 
 if has_adapter:
     # ---------- 模式一：加载已训练权重，跳过训练 ----------
     print(f"检测到已保存的LoRA适配器：{lora_save_path}，跳过训练")
-    model_lora = PeftModel.from_pretrained(model, lora_save_path)
-    # 默认 is_trainable=False：适配器权重 requires_grad=False，仅推理/评估
-    # 此时 print_trainable_parameters 会显示 0% 可训练——这是预期的
+    # ★ is_trainable=True：让 AdaLoraModel 走"训练模式"初始化分支，
+    #   设置 trainable_adapter_name（并创建 RankAllocator）——否则 forward 带 labels
+    #   时正交正则段访问该属性直接 AttributeError（peft 0.18.1 的 AdaLora 特有缺陷）
+    model_lora = PeftModel.from_pretrained(model, lora_save_path, is_trainable=True)
+    # 注意：此时 print_trainable_parameters 显示 ~0.8% 而非 0%（rank_pattern 缩形重建的
+    # 新参数逃过了 _freeze_adapter，见 8.4）——无害，本分支不会调用 trainer.train()，
+    # evaluate/generate 都在 eval()/no_grad 下执行，不会发生任何参数更新
     model_lora.print_trainable_parameters()
 else:
     # ---------- 模式二：首次运行，完整训练流程 ----------
-    peft_config = LoraConfig(
+    peft_config = AdaLoraConfig(
         task_type = TaskType.CAUSAL_LM,    
         inference_mode = False,   
         target_modules=[
@@ -171,9 +178,15 @@ else:
             "down_proj",
         ],
         bias = "none",
-        r = 8,    
-        lora_alpha = 16,                 # 一般为2r    
-        lora_dropout = 0.1               # 防止过拟合
+        target_r = 8,
+        init_r   = 12,
+        tinit    = 5,           # 热身段：回调步号 0~5 预算不动
+        tfinal   = 15,          # 定秩段：从第 total_step−tfinal = 45 步起（45 步为切换点：
+                                #   强制 mask + 清空重要性统计；46 步起每步按 rank_pattern 重新 mask）
+        deltaT   = 2,           # 衰减段内每 2 步 mask 一次
+        total_step = 60,        # ★ 必填：= (80/4) × num_train_epochs；回调传入的步号是 0~59
+        lora_alpha = 16,        # AdaLora 的缩放与 LoRA 的 alpha/r 语义不同    
+        lora_dropout = 0.1,     # 防止过拟合
     )
     model_lora = get_peft_model(model, peft_config)
     model_lora.enable_input_require_grads()  # ✅ 新增：让冻结embedding的输出可求导，配合梯度检查点
@@ -210,8 +223,8 @@ def custom_collate_fn(features):
 data_collator = custom_collate_fn
 
 training_args = TrainingArguments(
-    output_dir="./training/qwen3-0.6b_Lora/output",
-    logging_dir="./training/qwen3-0.6b_Lora/logs",
+    output_dir="./training/qwen3-0.6b_AdaLora/output",
+    logging_dir="./training/qwen3-0.6b_AdaLora/logs",
     logging_strategy="steps",
     logging_steps=10,
     #eval_strategy="steps",
@@ -221,12 +234,13 @@ training_args = TrainingArguments(
     save_strategy="epoch",
     #save_steps=200,
     save_total_limit=3,
+    num_train_epochs=3,
 
     # ========== OOM修复参数 ==========
     per_device_train_batch_size=1,       # 6G卡，全量微调建议1；实在不行用 gradient_accumulation_steps
     gradient_accumulation_steps=4,       # 梯度累积，模拟 bs=4
     per_device_eval_batch_size=1,        # =8 会OOM
-    gradient_checkpointing=False,        # ✅ 梯度检查点，大幅降低激活显存，速度会慢一点
+    gradient_checkpointing=True,        # ✅ 梯度检查点，大幅降低激活显存，速度会慢一点
     gradient_checkpointing_kwargs={      # ✅ 新增：非reentrant检查点，不依赖输入梯度
         "use_reentrant": False
     },
@@ -238,13 +252,25 @@ training_args = TrainingArguments(
     report_to="none",
 )
 
+class AdaLoraBudgetCallback(TrainerCallback):
+    """AdaLora 秩预算调度必须每步手动触发。
+    时机选 on_optimizer_step（optimizer.step 之后、zero_grad 之前），
+    与 peft 官方示例的位置一一对应：
+      backward → optimizer.step() → update_and_allocate → zero_grad
+    而常见的 on_step_end 写法在 transformers 4.55 中位于 zero_grad 之后，
+    此时 p.grad=None，update_ipt 会直接报错。"""
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        base = kwargs["model"].base_model      # PeftModel -> AdaLoraModel
+        base.update_and_allocate(state.global_step)
+
 trainer = Trainer(
     model=model_lora,
     args=training_args,
     train_dataset=tokenized_datasets["train"],
     eval_dataset=tokenized_datasets["validation"],
     data_collator=data_collator,
-    processing_class=tokenizer
+    processing_class=tokenizer,
+    callbacks=[AdaLoraBudgetCallback()],   # ← AdaLora 新增
 )
 
 # 固定同一批测试样本（微调前后必须完全一致）
@@ -289,7 +315,7 @@ else:
     print(baseline_eval)
     # 微调前基线生成（同样是 B=0 的模型在生成） 
     baseline_generations = [generate_answer(ins) for ins in test_instructions]
-    print("基线生成完成,开始 Lora 微调：")
+    print("基线生成完成,开始 AdaLora 微调：")
     trainer.train()
 
 
@@ -339,3 +365,9 @@ if not has_adapter:
     print(f"LoRA适配器已保存至：{lora_save_path}")
 else:
     print(f"已训练权重来自：{lora_save_path}（无需重复保存）")
+
+
+# ======= 检查 mask 是否生效（lora_E 的零值比例应从 0 升至约 1/3）=======
+for n, p in model_lora.named_parameters():
+    if "lora_E" in n:
+        print(n, f"{(p == 0).float().mean().item():.2%}")
