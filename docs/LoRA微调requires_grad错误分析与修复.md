@@ -1343,6 +1343,10 @@ else:
 
 ### 15.8 落地检查（2026-09-12）
 
+> ⚠️ **后续状态更新**：本节检查针对的是 15.4 的 `disable_adapter` 基线方案，当时结论"实现正确"仍成立。
+> 但脚本后来参照 AdaLora 文档第九节改成了 `trainer_baseline`（包装前基线）结构，**引入了"基线块位置
+> 错误"的新 bug**（复用模式基线失真为 -0.0%），分析与修复见**第十七节**。
+
 对照第十五节逐行复查修改后的脚本，**实现正确、两种模式均可运行，无阻断性 bug**：
 
 | 检查项 | 状态 |
@@ -1422,3 +1426,160 @@ else:
 > 本次踩过的所有坑几乎都来自三个交叉点：**冻结与建图**（PEFT × 检查点 × collator 里 labels
 > 的流转）、**词表与规模**（loss 显存、数据量、页缓存）、**口径与复现**（基线怎么定、对比怎么
 > 才可比、产物对不对得上代码版本）。下次换模型/数据/方法时，先按这三条线自查一遍。
+
+---
+
+## 十七、实战复盘：复用模式下基线与微调后无差别（-0.0%）——基线块位置错误
+
+> 背景：脚本后来仿照 AdaLora 文档第九节，把基线从 15.4 的 `disable_adapter` 方案改成了
+> `trainer_baseline`（独立 Trainer 用 `model` 评基线）结构。首训正常，复用模式基线失真。
+
+### 17.1 现象
+
+| 运行 | 基线 | 微调后 | delta | 预期 |
+|---|---|---|---|---|
+| 首次（真训练） | 4.8659 | 4.5211 | **-7.1%** ✓ | — |
+| 第二次（复用成果） | **4.5216** | 4.5211 | **-0.0%** ✗ | 基线应为 ≈4.8659（纯 base），delta -7.1% |
+
+### 17.2 破案关键：基线的数值自己招了
+
+4.5216 和 4.5211 几乎相同——**"基线"评的根本不是 base 模型，而是加载了适配器权重的模型**。
+真正的 base 基线是 4.8659（首训那次已经测出来了）。所以问题不是"微调没效果"，而是
+"复用模式下，基线评估发生时模型已经不是 base 了"。
+
+另一个佐证：两次运行的**微调后 eval_loss 逐位一致**（4.521068572998047）——说明适配器加载
+无损、评估确定性正常，唯独基线跑偏。
+
+### 17.3 根因一（机制层）：PEFT 包装会**原地修改**传入的 model 对象
+
+`PeftModel.from_pretrained(model, path)`（以及 `get_peft_model(model, config)`）不是"返回一个
+新模型"，而是**就地改造传入的 model**：把目标 `nn.Linear` 原地替换成 `lora.Linear`，并把训练好的
+A/B 权重加载进去（`LoraModel._create_and_replace` → `_replace_module`，替换 parent 的子模块）。
+
+CPU 实验直接证明（同一变量前后对比）：
+
+```python
+m = AutoModelForCausalLM.from_pretrained("./model/Qwen3-0.6B", torch_dtype=torch.float32)
+m(input_ids=ids, labels=ids).loss   # 6.2944（纯 base）
+PeftModel.from_pretrained(m, "./training/qwen3-0.6b_Lora/lora_adapter")
+# 此刻再看同一个变量 m：
+# - m 的参数里出现了 196 个 lora_A/lora_B（原地注入）
+# - m(input_ids=ids, labels=ids).loss = 6.2188（适配器生效，≠ base）
+```
+
+**推论**：`Trainer(model=model, ...)` 里写 `model` 只是引用了一个 Python 变量名——它指向的
+对象是否还是"原始 base"，取决于构造 Trainer 的**时刻**是否在包装之前，与变量叫什么、注释写
+什么完全无关。
+
+### 17.4 根因二（结构层）：基线块放在了 has_adapter 分支之后
+
+当前脚本的结构（行号为当前文件）：
+
+```
+L147-180  has_adapter 判断 + 分支
+          ├─ 加载分支 L155: model_lora = PeftModel.from_pretrained(model, ...)  ← model 在此被改造
+          └─ 训练分支 L178: model_lora = get_peft_model(model, ...)             ← 同样原地
+L183      # ==== 微调前基线评估（peft 包装前：原始 model）====   ← 注释宣称"包装前"
+L212-226  training_args_baseline + trainer_baseline（model=model） ← 但此刻 model 早已不是 base
+L254-259  baseline_eval = trainer_baseline.evaluate()            ← 评的是适配器模型 → 4.5216
+```
+
+注释写着"peft 包装前：原始 model"，**但物理位置在包装之后**——这正是 AdaLora 文档第九节
+强调的"**基线评估块整体上移到包装之前**"：当时只复制了基线块的代码，没有把"位置必须在
+包装之前"这个约束一起搬过来。对照 AdaLora 脚本（`test_AdaLora_qwen3-0.6b.py`）：它的基线块
+在 L150-226，`has_adapter` 分支在 L229 之后——顺序是对的；LoRA 脚本反了。
+
+顺带修正一个历史认知：十五节 15.3 把 has_adapter 分支放在原 peft_config 位置（脚本前部），
+15.4 用 `disable_adapter` 解决基线——**那套方案顺序自洽**；换成 `trainer_baseline` 结构后，
+"基线块必须在包装之前"就成了硬约束，位置没跟着搬，bug 就来了。
+
+### 17.5 顺带解释：为什么基线 4.5216 ≠ 微调后 4.5211（差 0.0006）
+
+评的是同一个模型，逐位却不同：`training_args_baseline`（L212-218）**没有 `bf16=True`**，
+主 `training_args`（L285）有——两个 Trainer 的 autocast 数值路径不同（无 autocast 时前向按权重
+dtype 计算；有 autocast(bf16) 时 linear/matmul 被强制 cast，layer norm 等走 fp32），微小数值差异
+累计 0.0006。这解释了 AdaLora 文档第九节 9.5 第 1 条为什么要强调"baseline args 必须与主
+Trainer 的 bf16 一致"：**基线与微调后的对比是跨 Trainer 的，精度口径必须对齐，否则对比里混入
+数值路径的噪声**。（对 base 模型两者恰好 bit-exact——首训基线 4.8659 与 AdaLora 侧 bf16 版
+完全相同——因为权重本身就是 bf16；对适配器模型则有可观测差异。）
+
+### 17.6 修复方案 A（推荐）：基线块整体上移到包装之前
+
+与 AdaLora 脚本/文档第九节完全统一。把 **L183-259 整段**（`custom_collate_fn`、
+`data_collator`、`training_args_baseline`、`trainer_baseline`、`N_COMPARE`/`test_*`、
+`generate_answer`、基线执行）**剪切**到 `# ===================== 加载 =====================`
+（L147）**之前**。目标顺序：
+
+```python
+# ===================== 微调前基线评估（peft 包装之前！此时 model 还是纯 base）=====
+def custom_collate_fn(features): ...
+data_collator = custom_collate_fn
+training_args_baseline = TrainingArguments(
+    ...,
+    bf16=True,     # ★ 顺带补上：与主 trainer 精度口径对齐（17.5）
+)
+trainer_baseline = Trainer(model=model, ...)   # ← 此刻注释"原始 model，未包装"才名副其实
+baseline_eval = trainer_baseline.evaluate()
+baseline_generations = [generate_answer(model, ins) for ins in test_instructions]
+...
+
+# ===================== 加载 =====================
+lora_save_path = ...
+has_adapter = ...
+if has_adapter: ... else: ...        # ← 包装发生在基线之后，怎么改都不影响基线
+
+# ===================== 训练 =====================
+training_args = TrainingArguments(...)
+trainer = Trainer(model=model_lora, ...)
+if not has_adapter:
+    trainer.train()
+# 之后评估/对比/ROUGE/保存全部不动
+```
+
+三个注意点：
+1. `custom_collate_fn`/`generate_answer` 与包装无关，跟着基线块一起上移即可（它们只依赖
+   `tokenizer`/数据，主 Trainer 照常引用 `data_collator` 变量）；
+2. `test_instructions`/`test_references` 依赖 `raw_datasets`（早已就绪），上移无副作用；
+3. 上移后 L221 的注释"← 原始 model，未包装"才真正成立——**注释描述的状态由代码位置保证，
+   而不是由注释本身保证**。
+
+### 17.7 修复方案 B（备选）：保留现顺序，基线用 disable_adapter
+
+即回到十五节 15.4 的思路，只是载体从 `trainer` 换成 `trainer_baseline`（LoRA 的
+`disable_adapter` 完全干净，没有 AdaLora 的正则残留问题）：
+
+```python
+if has_adapter:
+    print("==== 基线评估（disable_adapter 临时关闭适配器 ≙ base 模型）====")
+    with model_lora.disable_adapter():
+        baseline_eval = trainer_baseline.evaluate()
+    with model_lora.disable_adapter():
+        baseline_generations = [generate_answer(model_lora, ins) for ins in test_instructions]
+else:
+    baseline_eval = trainer_baseline.evaluate()
+    baseline_generations = [generate_answer(model, ins) for ins in test_instructions]
+```
+
+可行但不如方案 A：两条路径的基线走不同代码，且 `disable_adapter` 的等价性是"方法相关的
+巧合"（AdaLora 文档 9.2 论证过其脆弱性）。**推荐 A**——两个脚本结构统一，互相参照成本最低。
+
+### 17.8 修复后验证清单
+
+1. 复用模式重跑：基线 eval_loss 应回到 **≈4.8659**（与首训基线一致；LoRA 基线是纯 CE，
+   不像 AdaLora 有正则差，理论上应与 4.865900993347168 逐位一致）；
+2. delta 显示 **-7.1%**（4.8659 → 4.5211），首训/复用两种模式的对比结论一致；
+3. 微调后 eval_loss 保持 4.521068572998047 逐位不变（此数字两次运行已复现，是加载无损的
+   金标准）；
+4. 生成对比：复用模式下"【微调前 base】"列的文本应与首训运行时该列**逐字一致**（greedy +
+   同 base 权重）——修复前它输出的是适配器模型的生成结果。
+
+### 17.9 经验沉淀
+
+1. **"变量名/注释说它是什么"不等于"它此刻是什么"**：`model` 在被 PEFT 包装后就是另一 个
+   对象了。判断一段评估代码评的是什么，看的是**执行时刻对象的状态**，不是变量名；
+2. **复制方案要连约束一起复制**：AdaLora 第九节的方案是"上移 + 独立 baseline Trainer"两件
+   套，只搬后半件、不搬"上移"，方案就失效了。迁移结构性改动时，先列出它的**前提条件清单**；
+3. **基线数值是最灵敏的自检器**：4.8659 这个数在首训时已经建立，任何一次运行的基线偏离它
+   （且没有正当理由），都说明基线出了问题——跨运行的"锚点数值"值得记录在文档里；
+4. 与 AdaLora 第九节互补的一课：那边是"包装后才评基线，靠 disable_adapter 打补丁 → 重构为
+   包装前"；这边是"重构为包装前时忘了真的移到包装前"。**两个脚本现在应统一为方案 A 结构**。

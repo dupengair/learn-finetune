@@ -147,6 +147,85 @@ tokenized_datasets["test"] = raw_datasets["test"].map(
 print("分词后数据集：", tokenized_datasets)
 
 
+# ===================== 微调前基线评估（peft 包装前：原始 model，纯 CE 口径）=====================
+# 不再依赖"B=0 等价"或 disable_adapter——那两条路径的 eval_loss 都被正交正则
+# 污染（实测 +0.5~0.7），见本文档第九节
+'''
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False # 因果语言模型，不是掩码语言模型
+)
+'''
+
+# ⚠️ 不能用 DataCollatorForLanguageModeling，三个坑（详见 docs 第十二节）：
+#   ① tokenizer.pad 不填充 labels，eval批量>1时长度参差会崩
+#   ② mlm=False 分支用 input_ids 覆盖 labels，prompt=-100 的 mask 静默失效
+#   ③ labels==pad_token_id(即<|im_end|>)被改成-100，模型学不到停止符
+def custom_collate_fn(features):
+    """动态padding到batch内最长：input_ids补pad_token_id、attention_mask补0、labels补-100"""
+    max_len = max(len(f["input_ids"]) for f in features)
+    return {
+        "input_ids": torch.tensor(
+            [f["input_ids"] + [tokenizer.pad_token_id] * (max_len - len(f["input_ids"])) for f in features],
+            dtype=torch.long),
+        "attention_mask": torch.tensor(
+            [f["attention_mask"] + [0] * (max_len - len(f["attention_mask"])) for f in features],
+            dtype=torch.long),
+        "labels": torch.tensor(
+            [f["labels"] + [-100] * (max_len - len(f["labels"])) for f in features],
+            dtype=torch.long),
+    }
+
+data_collator = custom_collate_fn
+
+training_args_baseline = TrainingArguments(
+    output_dir="./training/qwen3-0.6b_AdaLora/output",  # do_train=False 不写东西，仅形式必填
+    per_device_eval_batch_size=1,     # 与主 Trainer 一致（6G 卡 OOM 规避）
+    bf16=True,                        # ★ 与主 Trainer 一致，保证基线/微调后 loss 精度口径相同
+    do_train=False,
+    do_eval=True,
+    report_to="none",
+)
+trainer_baseline = Trainer(
+    model=model,                      # ← 原始 model，未包装
+    args=training_args_baseline,
+    eval_dataset=tokenized_datasets["validation"],
+    data_collator=data_collator,
+    processing_class=tokenizer,
+)
+
+# 固定同一批测试样本（微调前后必须完全一致）
+N_COMPARE = 5    # 验证集不足5条就调小
+test_instructions = [raw_datasets["validation"][i]["INSTRUCTION"] for i in range(N_COMPARE)]
+test_references   = [raw_datasets["validation"][i]["RESPONSE"]    for i in range(N_COMPARE)]
+
+# 训练模式 B=0≡base 直接评；加载模式用 disable_adapter() 切回 base
+def generate_answer(m, instruction, max_new_tokens=256):
+    """方案B核心：只用指令构造提示（不含答案！），greedy 解码保证前后对比可复现"""
+    user_str = f"<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+    inputs = tokenizer(user_str, return_tensors="pt").to(m.device)
+    m.eval()   # 关掉 dropout(lora_dropout=0.1)，否则 train 模式下 greedy 也不可复现
+    with torch.no_grad():
+        output = m.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,     # greedy：同输入必同输出，前后对比才有效
+            temperature=1.0,     # ← 中性值，消除警告；贪心模式下无效参数
+            top_p=1.0,           # ←
+            top_k=50,            # ←
+            pad_token_id=tokenizer.pad_token_id
+        )
+    # generate 返回 = 提示原样在前 + 新生成在后；切掉提示只解码新生成部分
+    new_tokens = output[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(new_tokens, skip_special_tokens=False)
+
+print("==== 预训练模型原始基线（纯 base 前向）====")
+baseline_eval = trainer_baseline.evaluate()
+print(baseline_eval)
+baseline_generations = [generate_answer(model, ins) for ins in test_instructions]
+print("基线评估完成")
+
+
 # ===================== 加载 =====================
 lora_save_path = "./training/qwen3-0.6b_AdaLora/lora_adapter"   # ← 从文件末尾上移到此处定义
 # 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
@@ -180,12 +259,12 @@ else:
         bias = "none",
         target_r = 8,
         init_r   = 12,
-        tinit    = 5,           # 热身段：回调步号 0~5 预算不动
-        tfinal   = 15,          # 定秩段：从第 total_step−tfinal = 45 步起（45 步为切换点：
+        tinit    = 50,          # 热身段：回调步号 0~5 预算不动
+        tfinal   = 50,          # 定秩段：从第 total_step−tfinal = 45 步起（45 步为切换点：
                                 #   强制 mask + 清空重要性统计；46 步起每步按 rank_pattern 重新 mask）
-        deltaT   = 2,           # 衰减段内每 2 步 mask 一次
-        total_step = 60,        # ★ 必填：= (80/4) × num_train_epochs；回调传入的步号是 0~59
-        lora_alpha = 16,        # AdaLora 的缩放与 LoRA 的 alpha/r 语义不同    
+        deltaT   = 4,           # 衰减段内每 2 步 mask 一次
+        total_step = 200,       # ★ 必填：= (80/4) × num_train_epochs；回调传入的步号是 0~59
+        lora_alpha = 24,        # AdaLora 的缩放与 LoRA 的 alpha/r 语义不同    
         lora_dropout = 0.1,     # 防止过拟合
     )
     model_lora = get_peft_model(model, peft_config)
@@ -194,34 +273,6 @@ else:
 
 
 # ===================== 训练 =====================
-'''
-data_collator = DataCollatorForLanguageModeling(
-    tokenizer=tokenizer,
-    mlm=False # 因果语言模型，不是掩码语言模型
-)
-'''
-
-# ⚠️ 不能用 DataCollatorForLanguageModeling，三个坑（详见 docs 第十二节）：
-#   ① tokenizer.pad 不填充 labels，eval批量>1时长度参差会崩
-#   ② mlm=False 分支用 input_ids 覆盖 labels，prompt=-100 的 mask 静默失效
-#   ③ labels==pad_token_id(即<|im_end|>)被改成-100，模型学不到停止符
-def custom_collate_fn(features):
-    """动态padding到batch内最长：input_ids补pad_token_id、attention_mask补0、labels补-100"""
-    max_len = max(len(f["input_ids"]) for f in features)
-    return {
-        "input_ids": torch.tensor(
-            [f["input_ids"] + [tokenizer.pad_token_id] * (max_len - len(f["input_ids"])) for f in features],
-            dtype=torch.long),
-        "attention_mask": torch.tensor(
-            [f["attention_mask"] + [0] * (max_len - len(f["attention_mask"])) for f in features],
-            dtype=torch.long),
-        "labels": torch.tensor(
-            [f["labels"] + [-100] * (max_len - len(f["labels"])) for f in features],
-            dtype=torch.long),
-    }
-
-data_collator = custom_collate_fn
-
 training_args = TrainingArguments(
     output_dir="./training/qwen3-0.6b_AdaLora/output",
     logging_dir="./training/qwen3-0.6b_AdaLora/logs",
@@ -234,7 +285,9 @@ training_args = TrainingArguments(
     save_strategy="epoch",
     #save_steps=200,
     save_total_limit=3,
-    num_train_epochs=3,
+    num_train_epochs=10,          # ① 3→10：80条数据下60步根本不够，先加训练量
+    learning_rate=2e-4,           # ② ★ 显式设置！默认5e-5对adapter训练太低（本节根因1）
+    warmup_ratio=0.1,             # ③ 可选：前10%步数线性预热，AdaLora论文亦用warmup
 
     # ========== OOM修复参数 ==========
     per_device_train_batch_size=1,       # 6G卡，全量微调建议1；实在不行用 gradient_accumulation_steps
@@ -273,49 +326,9 @@ trainer = Trainer(
     callbacks=[AdaLoraBudgetCallback()],   # ← AdaLora 新增
 )
 
-# 固定同一批测试样本（微调前后必须完全一致）
-N_COMPARE = 5    # 验证集不足5条就调小
-test_instructions = [raw_datasets["validation"][i]["INSTRUCTION"] for i in range(N_COMPARE)]
-test_references   = [raw_datasets["validation"][i]["RESPONSE"]    for i in range(N_COMPARE)]
-
-# 微调前基线评估 + 生成对比准备,基线评估在下方按 has_adapter 分两种模式：
-# 训练模式 B=0≡base 直接评；加载模式用 disable_adapter() 切回 base
-def generate_answer(instruction, max_new_tokens=256):
-    """方案B核心：只用指令构造提示（不含答案！），greedy 解码保证前后对比可复现"""
-    user_str = f"<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
-    inputs = tokenizer(user_str, return_tensors="pt").to(model_lora.device)
-    model_lora.eval()   # 关掉 dropout(lora_dropout=0.1)，否则 train 模式下 greedy 也不可复现
-    with torch.no_grad():
-        output = model_lora.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,     # greedy：同输入必同输出，前后对比才有效
-            temperature=1.0,     # ← 中性值，消除警告；贪心模式下无效参数
-            top_p=1.0,           # ←
-            top_k=50,            # ←
-            pad_token_id=tokenizer.pad_token_id
-        )
-    # generate 返回 = 提示原样在前 + 新生成在后；切掉提示只解码新生成部分
-    new_tokens = output[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=False)
-
-if has_adapter:
-    # 加载模式：用 disable_adapter() 临时关闭适配器得到 base 基线
-    print("==== 基线评估（disable_adapter 临时关闭适配器 ≙ base 模型）====")
-    with model_lora.disable_adapter():
-        baseline_eval = trainer.evaluate()
-    print(baseline_eval)
-    with model_lora.disable_adapter():
-        baseline_generations = [generate_answer(ins) for ins in test_instructions]
-    print("基线生成完成（已训练权重模式）")
-else:
-    # 训练模式：B=0 数学上等价 base，直接评估/生成
-    print("==== 预训练模型原始基线 ====")
-    baseline_eval = trainer.evaluate()
-    print(baseline_eval)
-    # 微调前基线生成（同样是 B=0 的模型在生成） 
-    baseline_generations = [generate_answer(ins) for ins in test_instructions]
-    print("基线生成完成,开始 AdaLora 微调：")
+# AdaLora微调
+if not has_adapter:
+    print("开始 AdaLora 微调：")
     trainer.train()
 
 
@@ -330,7 +343,7 @@ print(f"eval_loss 对比：{baseline_eval['eval_loss']:.4f} -> "
       f"{after_eval['eval_loss']:.4f}（{delta:+.1f}%）")
 
 # 微调后生成同一批指令
-after_generations = [generate_answer(ins) for ins in test_instructions]
+after_generations = [generate_answer(model_lora, ins) for ins in test_instructions]
 
 # 前后对比打印 + 可选 ROUGE
 for i in range(N_COMPARE):
