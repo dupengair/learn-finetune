@@ -314,3 +314,77 @@ with torch.no_grad():
   - README 的成果表可以把 Prefix 行从“脚本就绪”改为“已跑通流程；机制性起点罚金，效果线不采用（详见 docs）”——一句结论留给未来的自己；
   - 下一步精力建议放在：三条已验证线的横向对比总结（LoRA -7.1% / AdaLora -4.4% / QLoRA 口径独立，同数据同超参下的相对效果 + 显存 +
   速度），这比再开一条新方法线更符合学习仓库的收束节奏。
+
+---
+
+## 八、实战复盘（续）：`prefix_projection=True` 让 Prefix 线由败转胜
+
+> 现象：在 `test_Prefix_qwen3-0.6b.py` 的 `PrefixTuningConfig` 里加一行 `prefix_projection=True` 后，同一份数据、同一组超参（lr=1e-4, 10 epochs, gc=False）下：
+> **eval_loss 4.8659 → 4.4212（-9.1%），ROUGE-L 0.0174 → 0.0258，无乱码**——与第七节 projection=False 的 +119.1%/乱码形成断崖式反差。
+> 本节用源码 + CPU 对照实验回答三个问题：差异为什么这么大？为什么现在正常了？之前的分析是否被干扰？
+
+### 8.1 先看结论：变化的不止一个变量，而是一组
+
+`prefix_projection` 翻转后，peft 的 `PrefixEncoder`（`peft/tuners/prefix_tuning/model.py`）从「直接训练 KV 表」切换为「MLP 生成 KV」：
+
+```python
+if self.prefix_projection:                        # = True（现在）
+    self.embedding = nn.Embedding(num_virtual_tokens, token_dim)          # 16×1024
+    self.transform = nn.Sequential(
+        nn.Linear(token_dim, encoder_hidden_size),    # 1024→512
+        nn.Tanh(),                                    # ★ 有界激活：把 N(0,1) 压进 (-1,1)
+        nn.Linear(encoder_hidden_size, num_layers*2*token_dim),  # 512→57344（初始化可控输出尺度）
+    )
+else:                                             # = False（第七节的形态，也是 v2 论文形态）
+    self.embedding = nn.Embedding(num_virtual_tokens, num_layers*2*token_dim)  # 直接当 KV 用
+```
+
+三个变量同时改变：**初始输出尺度**、**可训练参数量**、**参数化结构**。CPU 同口径对照实测（3 条训练分布样本，fp32）：
+
+| 形态 | 包装后未训练 loss（相对 base） | 初始 prefix 输出 | 可训练参数 |
+|---|---|---|---|
+| 纯 base | 3.4265（基准） | — | 0 |
+| projection=False（第七节/v2 形态） | 12.4707（**+9.04**） | std=**0.9997**，absmax=4.70 | 917,504（0.9M） |
+| projection=True（本次） | 8.4518（**+5.03**） | std=**0.2653**，absmax=1.35 | **59,843,584（≈60M，65 倍）** |
+
+### 8.2 为什么现在正常了：三因素合力填平了门槛坑
+
+1. **初始伤害缩小约 44%**：`Tanh` 有界 + 末层 `Linear` 的默认初始化（`U(±1/√fan_in)`，fan_in=512）把初始 prefix 尺度从 std≈1.0 压到 std≈0.27（实测），对 attention 的扰动同比例缩小——起点坑从 +9.04 降到 +5.03。第七节 7.5 目标 C 的预言（"输出尺度受 Linear 初始化控制"）被实测证实；
+2. **优化能力放大 65 倍**：可训练参数 0.9M → 60M（其中末层 Linear 约 29M+），200 步 × lr=1e-4 的"填坑预算"完全不够 0.9M 个自由度直接写出好的 KV 值，但对一个 60M 的 MLP 来说轻而易举——这正是终点能从起点坑爬出来并**反超基线**（4.42 < 4.87）的原因。注意 KV 注入门槛本身（第七节实验 2 的 +4 左右，与值无关）**并没有消失**，只是这次被训练填平了；
+3. **优化景观更平滑**：直接对 embedding 写 KV（False 形态）等于让优化器"裸写" attention 的键值，梯度信号稀疏尖锐；经 MLP 参数化后梯度在 60M 参数上分摊，这是经典的 reparameterization 益处。
+
+### 8.3 回答"是不是之前有其它原因干扰了结果"：有一处，但不影响定性结论
+
+复查 7.6 复现代码发现一处实验瑕疵，如实勘误：
+
+```python
+cache.update(k.clone(), k.clone(), i)   # v 同 k（zeros 或同随机）   ← K 和 V 用了同一个张量！
+```
+
+- 对**零 KV** 实验（8.71，门槛 +4.3 的核心证据）无影响（0=0）；**门槛结论仍然成立**；
+- 但对 **N(0,1) 注入实验（13.0）**，K=V 会让 attention score 退化成自相似矩阵（元素全非负、对角最大），比真实的独立 K/V **破坏性更强**——13.0 这个数字可能被夸大；
+- 这不影响本次复盘的主结论：projection=True 的改善来自 8.2 的三个真实机制，且「v2 形态差、原版形态好」的断崖反差已经被两条独立实验链（第七节 GPU、本节 CPU）+ 最终训练结果三重确认。
+
+### 8.4 与论文谱系互证：你的实测恰好落在文献的分界线上
+
+- **原版 Prefix Tuning（Li & Liang 2021）**：论文明确指出直接优化 prefix embedding 不稳定，**重参数化 MLP 是方法的一部分**——你现在的配置就是论文原版形态；
+- **P-Tuning v2（Liu et al. 2022）**：敢去掉重参数化（`prefix_projection=False`）的前提是 **300M–10B 模型 + SuperGLUE 全量数据 + 精细调参**——0.6B 模型 + 100 条数据正处于「重参数化必要」的区间，你的实测（False 崩、True 好）与文献判断完全一致；
+- 因此 **PTuningV2 脚本（projection=False）维持 +119% 是自洽且预期内的**，不是新 bug：它就是那个"小数据下不该裸用"的形态。
+
+### 8.5 两个脚本的现状：对照实验成型
+
+至此 5.3/6.3 目标 B 提议的对照已经成立，无需再做：
+
+| 脚本 | 形态 | 起点 | 终点 | 定位 |
+|---|---|---|---|---|
+| test_Prefix_qwen3-0.6b.py | 原版 Prefix Tuning（重参数化） | +5.0 | **-9.1%，无乱码** ✅ | 效果可用，实验成功 |
+| test_PTuningV2_qwen3-0.6b.py | P-Tuning v2 论文形态（无重参数化） | +9.0 | +119.4%，乱码 | 机制对照，封存结论 |
+
+一句话总结留给未来的自己：**Prefix 系方法在小数据/小模型上，「重参数化」不是可选项而是稳定性的前提；v2 去掉它省的是显存和参数，赌的是大模型大数据的优化能力。**
+
+### 8.6 代价与注意事项（projection=True 的账）
+
+- 可训练参数 0.9M → 60M：Adam 状态 fp32 约 480MB + 梯度/权重 480MB ≈ **额外 ~1GB 显存**（6G 卡实测跑通，但离 OOM 边界更近；若紧张可把 `encoder_hidden_size` 从默认 512 降到 256，参数约减半）；
+- `encoder_hidden_size` 只在 `prefix_projection=True` 时生效——这正是 PTuningV2 报告 5.2② 让你删掉它的原因（v2 形态传了会 TypeError/无意义）；
+- 保存的适配器从 ~3.7MB 涨到 ~240MB（60M × fp32）；
+- 与 LoRA 线（-7.1%）可比了：Prefix(-9.1%) 是目前 Qwen 线最佳，但注意 Prefix 推理要背 KV 注入、LoRA 可 merge 零开销——离线效果数字之外还有部署维度。

@@ -231,6 +231,7 @@ else:
         peft_type="PREFIX_TUNING",  # LoRA/AdaLora/PrefixTuning/PromptTuning
         task_type = TaskType.CAUSAL_LM,    
         num_virtual_tokens=16,        # 可学习前缀token数量，常用8/16/32，越大参数量越多
+        prefix_projection=True,       # 原版 Prefix Tuning 论文形态：每层前缀 + MLP 重参数化 
     )
     model_trained = get_peft_model(model, peft_config)
     model_trained.config.use_cache = False   # 训练时不缓存 KV，省 ~100MB；generate 不受影响
