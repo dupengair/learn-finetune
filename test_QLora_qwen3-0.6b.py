@@ -185,6 +185,7 @@ data_collator = custom_collate_fn
 training_args_baseline = TrainingArguments(
     output_dir="./training/qwen3-0.6b_QLora/output",
     per_device_eval_batch_size=1,     # 与主 Trainer 一致（6G 卡 OOM 规避）
+    bf16=True,
     do_train=False,
     do_eval=True,
     report_to="none",
@@ -325,7 +326,7 @@ if not has_adapter:
 # ===================== 评估 =====================
 print("开始评估：")
 # 微调后 eval_loss
-print("==== LoRA 微调后 ====")
+print("==== QLoRA 微调后 ====")
 after_eval = trainer.evaluate()
 print(after_eval)
 delta = (after_eval["eval_loss"] - baseline_eval["eval_loss"]) / baseline_eval["eval_loss"] * 100

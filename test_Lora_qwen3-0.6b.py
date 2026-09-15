@@ -12,14 +12,13 @@ from transformers import (
     TrainingArguments,
     Trainer
 )
+
 from datasets import load_dataset, DatasetDict
-# from typing import List, Dict
 import evaluate as ev
 import torch, os
 
 
 # ===================== 加载模型 =====================
-# model_name = "Qwen/Qwen3-0.6B"
 model_path = "./model/Qwen3-0.6B" 
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
@@ -176,6 +175,7 @@ data_collator = custom_collate_fn
 training_args_baseline = TrainingArguments(
     output_dir="./training/qwen3-0.6b_Lora/output",
     per_device_eval_batch_size=1,     # 与主 Trainer 一致（6G 卡 OOM 规避）
+    bf16=True,
     do_train=False,
     do_eval=True,
     report_to="none",

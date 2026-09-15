@@ -293,7 +293,7 @@ training_args = TrainingArguments(
     per_device_train_batch_size=1,       # 6G卡，全量微调建议1；实在不行用 gradient_accumulation_steps
     gradient_accumulation_steps=4,       # 梯度累积，模拟 bs=4
     per_device_eval_batch_size=1,        # =8 会OOM
-    gradient_checkpointing=True,        # ✅ 梯度检查点，大幅降低激活显存，速度会慢一点
+    gradient_checkpointing=True,         # ✅ 梯度检查点，大幅降低激活显存，速度会慢一点
     gradient_checkpointing_kwargs={      # ✅ 新增：非reentrant检查点，不依赖输入梯度
         "use_reentrant": False
     },
@@ -335,7 +335,7 @@ if not has_adapter:
 # ===================== 评估 =====================
 print("开始评估：")
 # 微调后 eval_loss
-print("==== LoRA 微调后 ====")
+print("==== AdaLoRA 微调后 ====")
 after_eval = trainer.evaluate()
 print(after_eval)
 delta = (after_eval["eval_loss"] - baseline_eval["eval_loss"]) / baseline_eval["eval_loss"] * 100
