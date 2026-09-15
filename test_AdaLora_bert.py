@@ -174,7 +174,8 @@ else:
 
 training_args = TrainingArguments(
     output_dir="./training/bert-base-uncased_AdaLora/output",
-    logging_dir="./training/bert-base-uncased_Lora/logs",
+    logging_dir="./training/bert-base-uncased_AdaLora/logs",
+    report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
     logging_strategy="steps",
     logging_steps=10,
     # save_strategy="steps",

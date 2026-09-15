@@ -108,7 +108,7 @@ data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 # baseline 评估用，不需要保存/eval策略，最简配置
 training_args_baseline = TrainingArguments(
-    output_dir="./training/bert-base-uncased_AdaLora/output",
+    output_dir="./training/bert-base-uncased_Lora/output",
     per_device_eval_batch_size=8,
     do_train=False,
     do_eval=True,
@@ -148,8 +148,9 @@ model_lora = get_peft_model(model, peft_config)
 model_lora.print_trainable_parameters()  # 打印可训练参数
 
 training_args = TrainingArguments(
-    output_dir="./training/bert-base-uncased_AdaLora/output",
-    logging_dir="./training/bert-base-uncased_AdaLora/logs",
+    output_dir="./training/bert-base-uncased_Lora/output",
+    logging_dir="./training/bert-base-uncased_Lora/logs",
+    report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
     logging_strategy="steps",
     logging_steps=10,
     # save_strategy="steps",

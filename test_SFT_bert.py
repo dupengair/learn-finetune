@@ -110,6 +110,7 @@ training_args = TrainingArguments(
     gradient_checkpointing=True,     # ✅开启梯度检查点，大幅降低激活显存，代价训练速度变慢
     load_best_model_at_end=True,
     metric_for_best_model="f1",
+    report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
 )
 
 trainer = Trainer(

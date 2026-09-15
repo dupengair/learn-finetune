@@ -1,5 +1,5 @@
 from peft import (
-    PrefixTuningConfig,
+    PromptTuningConfig,
     TaskType,
     get_peft_model,
     PeftModel
@@ -214,23 +214,28 @@ print("基线生成完成")
 
 
 # ===================== 加载 =====================
-lora_save_path = "./training/qwen3-0.6b_Prefix/lora_adapter"   # ← 从文件末尾上移到此处定义
+lora_save_path = "./training/qwen3-0.6b_Prompt/lora_adapter"   # ← 从文件末尾上移到此处定义
 # 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
 has_adapter = os.path.exists(os.path.join(lora_save_path, "adapter_config.json"))
 
 if has_adapter:
     # ---------- 模式一：加载已训练权重，跳过训练 ----------
-    print(f"检测到已保存的Prefix适配器：{lora_save_path}，跳过训练")
+    print(f"检测到已保存的Prompt适配器：{lora_save_path}，跳过训练")
     model_trained = PeftModel.from_pretrained(model, lora_save_path)
     # 默认 is_trainable=False：适配器权重 requires_grad=False，仅推理/评估
     # 此时 print_trainable_parameters 会显示 0% 可训练——这是预期的
     model_trained.print_trainable_parameters()
 else:
     # ---------- 模式二：首次运行，完整训练流程 ----------
-    peft_config = PrefixTuningConfig(
-        peft_type="PREFIX_TUNING",  # LoRA/AdaLora/PrefixTuning/PromptTuning
+    peft_config = PromptTuningConfig(
+        peft_type="PROMPT_TUNING",  # LoRA/AdaLora/PrefixTuning/PromptTuning
         task_type = TaskType.CAUSAL_LM,    
-        num_virtual_tokens=16,        # 可学习前缀token数量，常用8/16/32，越大参数量越多
+        num_virtual_tokens=16,                  # 虚拟prompt token数量，常用8/16/32；参数量远小于Prefix Tuning
+        prompt_tuning_init="TEXT",
+        prompt_tuning_init_text="你是一个知识渊博的知乎答主，请用中文认真、详细地回答用户提出的问题",  # >16 token，会被截到16   
+                                                # 用一段文本embedding初始化虚拟token，可选，也可以设为RANDOM随机初始化
+        tokenizer_name_or_path="./model/Qwen3-0.6B",  # 本地tokenizer路径，离线环境必填
+        inference_mode=False
     )
     model_trained = get_peft_model(model, peft_config)
     model_trained.config.use_cache = False   # 训练时不缓存 KV，省 ~100MB；generate 不受影响
@@ -238,8 +243,8 @@ else:
     
 # ===================== 训练 =====================
 training_args = TrainingArguments(
-    output_dir="./training/qwen3-0.6b_Prefix/output",
-    logging_dir="./training/qwen3-0.6b_Prefix/logs",
+    output_dir="./training/qwen3-0.6b_Prompt/output",
+    logging_dir="./training/qwen3-0.6b_Prompt/logs",
     logging_steps=10,             # 默认500>全程200步会导致train_loss一条都不记；每epoch记2点，与仓库其他脚本一致
     #eval_strategy="steps",
     eval_strategy="epoch",
@@ -249,7 +254,7 @@ training_args = TrainingArguments(
     #save_steps=200,
     save_total_limit=3,
     num_train_epochs=10,          # ① 3→10：80条数据下60步根本不够，先加训练量
-    learning_rate=1e-4,           # ② ★ 显式设置！默认5e-5对adapter训练太低（本节根因1）
+    learning_rate=5e-3,           # ② ★ 显式设置！默认5e-5对adapter训练太低（本节根因1）
     warmup_ratio=0.1,             # ③ 可选：前10%步数线性预热，AdaLora论文亦用warmup
     
     # ========== OOM修复参数 ==========
@@ -279,14 +284,14 @@ trainer = Trainer(
 
 # 微调
 if not has_adapter:
-    print("开始 Prefix 微调：")
+    print("开始 Prompt 微调：")
     trainer.train()
 
 
 # ===================== 评估 =====================
 print("开始评估：")
 # 微调后 eval_loss
-print("==== Prefix Tuning 微调后 ====")
+print("==== Prompt Tuning 微调后 ====")
 after_eval = trainer.evaluate()
 print(after_eval)
 delta = (after_eval["eval_loss"] - baseline_eval["eval_loss"]) / baseline_eval["eval_loss"] * 100
@@ -301,7 +306,7 @@ for i in range(N_COMPARE):
     print(f"\n======== 样本 {i} ========")
     print(f"【指令】{test_instructions[i]}")
     print(f"【微调前 base】{baseline_generations[i]}")
-    print(f"【微调后 Prefix】{after_generations[i]}")
+    print(f"【微调后 Prompt】{after_generations[i]}")
     ref = test_references[i]
     print(f"【金标参考】{ref[:200]}{'...' if len(ref) > 200 else ''}")
 
@@ -321,12 +326,12 @@ except Exception as e:
     print("ROUGE 计算跳过：", e)
 
 
-# ============ 保存Prefix适配器（关键代码） ============
+# ============ 保存Prompt适配器（关键代码） ============
 if not has_adapter:
-    # 保存Prefix权重、adapter配置
+    # 保存Prompt权重、adapter配置
     trainer.save_model(lora_save_path)
     # 等价：model.save_pretrained(lora_save_path)
-    print(f"Prefix适配器已保存至：{lora_save_path}")
+    print(f"Prompt适配器已保存至：{lora_save_path}")
 else:
     print(f"已训练权重来自：{lora_save_path}（无需重复保存）")
 

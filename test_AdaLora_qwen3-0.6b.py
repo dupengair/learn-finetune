@@ -302,7 +302,7 @@ training_args = TrainingArguments(
 
     # 显存碎片优化
     optim="adamw_torch_fused",
-    report_to="none",
+    report_to="tensorboard",       # 启用TensorBoard上报loss曲线，用法见 docs/TensorBoard查看loss曲线操作指导.md
 )
 
 class AdaLoraBudgetCallback(TrainerCallback):

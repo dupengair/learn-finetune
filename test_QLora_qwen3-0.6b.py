@@ -306,7 +306,7 @@ training_args = TrainingArguments(
     # 显存碎片优化
     #optim="adamw_torch_fused",
     optim="paged_adamw_32bit",            # QLoRA 论文三要素之三：显存不够时优化器状态分页到 CPU，防 OOM 尖峰
-    report_to="none",
+    report_to="tensorboard",              # 启用TensorBoard上报loss曲线，用法见 docs/TensorBoard查看loss曲线操作指导.md
 )
 
 trainer = Trainer(
