@@ -142,7 +142,7 @@ if has_adapter:
     # ★ is_trainable=True 必须：evaluate/predict 的前向都带 labels，
     #   AdaLoraModel.forward 正则段访问 trainable_adapter_name（默认 False 时该属性
     #   不存在 → AttributeError，Qwen 报告第八节的坑在 BERT 侧同样成立）
-    model_lora = PeftModel.from_pretrained(model, lora_save_path, is_trainable=True)
+    model_lora = PeftModel.from_pretrained(model, lora_save_path)
     # 此时 print 显示 ~0.5%（55万上下）而非 0%——rank_pattern 缩形重建的新参数
     # 逃过了 _freeze_adapter（Qwen 报告 8.4）。无害：本分支不会 trainer.train()，
     # evaluate/predict 都在 no_grad 下执行，不会发生任何参数更新
@@ -166,41 +166,40 @@ else:
     model_lora = get_peft_model(model, peft_config)
     model_lora.print_trainable_parameters()  # 打印可训练参数
 
-    training_args = TrainingArguments(
-        output_dir="./training/bert-base-uncased_Lora/output",
-        logging_dir="./training/bert-base-uncased_Lora/logs",
-        report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
-        logging_strategy="steps",
-        logging_steps=10,
-        # save_strategy="steps",
-        # save_steps=100,
-        save_strategy="epoch",
-        save_total_limit=3,
-        # eval_strategy="steps",        # 旧版本用这个，不要写evaluation_strategy
-        # eval_steps=100,
-        eval_strategy="epoch",
-        per_device_train_batch_size=4,   # 从8降到4，降低激活显存
-        per_device_eval_batch_size=8,    # eval也降
-        num_train_epochs=3,
-        learning_rate=5e-4,
-        bf16=True,
-        gradient_checkpointing=True,     # ✅开启梯度检查点，大幅降低激活显存，代价训练速度变慢
-        load_best_model_at_end=True,
-        # metric_for_best_model="f1",
-        metric_for_best_model="macro_f1",
-        weight_decay=0.01    
-    )
+training_args = TrainingArguments(
+    output_dir="./training/bert-base-uncased_Lora/output",
+    logging_dir="./training/bert-base-uncased_Lora/logs",
+    report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
+    logging_strategy="steps",
+    logging_steps=10,
+    # save_strategy="steps",
+    # save_steps=100,
+    save_strategy="epoch",
+    save_total_limit=3,
+    # eval_strategy="steps",        # 旧版本用这个，不要写evaluation_strategy
+    # eval_steps=100,
+    eval_strategy="epoch",
+    per_device_train_batch_size=4,   # 从8降到4，降低激活显存
+    per_device_eval_batch_size=8,    # eval也降
+    num_train_epochs=3,
+    learning_rate=5e-4,
+    bf16=True,
+    gradient_checkpointing=True,     # ✅开启梯度检查点，大幅降低激活显存，代价训练速度变慢
+    load_best_model_at_end=True,
+    # metric_for_best_model="f1",
+    metric_for_best_model="macro_f1",
+    weight_decay=0.01    
+)
 
-    trainer = Trainer(
-        model=model_lora,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["validation"],
-        data_collator=data_collator,
-        processing_class=tokenizer,
-        compute_metrics=compute_metrics
-    )
-
+trainer = Trainer(
+    model=model_lora,
+    args=training_args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["validation"],
+    data_collator=data_collator,
+    processing_class=tokenizer,
+    compute_metrics=compute_metrics
+)
 
 # Lora微调
 if not has_adapter:

@@ -235,7 +235,7 @@ else:
         inference_mode=False
     )
     model_trained = get_peft_model(model, peft_config)
-    model_trained.config.use_cache = False   # 训练时不缓存 KV，省 ~100MB；generate 不受影响
+    model_trained.config.use_cache = False      # 训练时不缓存 KV，省 ~100MB；generate 不受影响
     model_trained.print_trainable_parameters()  # 打印可训练参数
     
 # ===================== 训练 =====================

@@ -1,5 +1,5 @@
 from peft import (
-    LoraConfig,
+    PrefixTuningConfig,
     TaskType,
     get_peft_model,
     PeftModel
@@ -103,12 +103,13 @@ def compute_metrics(eval_pred):
     res["macro_f1"] = f1_score(labels, predictions, average="macro")
     return res
 
-# ================== 训练&评估 ===================
+
+# ===================== 微调前基线评估（peft 包装前：原始 model）==========
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 # baseline 评估用，不需要保存/eval策略，最简配置
 training_args_baseline = TrainingArguments(
-    output_dir="./training/bert-base-uncased_Lora/output",
+    output_dir="./training/bert-base-uncased_PTuning-V2/output",
     per_device_eval_batch_size=8,
     do_train=False,
     do_eval=True,
@@ -132,77 +133,71 @@ print(baseline_result)
 
 
 # ===================== 加载 =====================
-lora_save_path = "./training/bert-base-uncased_Lora/lora_adapter"
+lora_save_path = "./training/bert-base-uncased_PTuning-V2/lora_adapter"
 # 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
 has_adapter = os.path.exists(os.path.join(lora_save_path, "adapter_config.json"))
 
 if has_adapter:
     # ---------- 模式一：加载已训练权重，跳过训练 ----------
-    print(f"检测到已保存的Lora适配器：{lora_save_path}，跳过训练")
+    print(f"检测到已保存的P-TuningV2适配器：{lora_save_path}，跳过训练")
     # ★ is_trainable=True 必须：evaluate/predict 的前向都带 labels，
     #   AdaLoraModel.forward 正则段访问 trainable_adapter_name（默认 False 时该属性
     #   不存在 → AttributeError，Qwen 报告第八节的坑在 BERT 侧同样成立）
-    model_lora = PeftModel.from_pretrained(model, lora_save_path, is_trainable=True)
+    model_trained = PeftModel.from_pretrained(model, lora_save_path)
     # 此时 print 显示 ~0.5%（55万上下）而非 0%——rank_pattern 缩形重建的新参数
     # 逃过了 _freeze_adapter（Qwen 报告 8.4）。无害：本分支不会 trainer.train()，
     # evaluate/predict 都在 no_grad 下执行，不会发生任何参数更新
-    model_lora.print_trainable_parameters()
+    model_trained.print_trainable_parameters()
 else:
     # ---------- 模式二：首次运行，完整训练流程 ----------
 
-    peft_config = LoraConfig(
+    peft_config = PrefixTuningConfig(
+        peft_type="PREFIX_TUNING",       # P-Tuning v2 = Deep Prompt Tuning（v2论文：Prefix Tuning机制的NLU适配版）    
         task_type = TaskType.SEQ_CLS,    # 序列分类，不是seq2seq
-        inference_mode = False,   
-        # target_modules：BERT需要显式指定lora作用的层，BertAttention里面q,k
-        # target_modules=["query","key"],
-        target_modules=["query","key","value"],
-        # bias = "none",
-        bias = "all", # 把所有bias打开，或者bias="lora_only"
-        modules_to_save=["classifier"], # 关键！把classifier整个层设为可训练   
-        r = 8,    
-        lora_alpha = 16,                 # 一般为2r    
-        lora_dropout = 0.1               # 防止过拟合
+        num_virtual_tokens=16,           # 每层注入的可学习前缀长度
+        prefix_projection=False,         # ★ v2关键设计：去掉重参数化MLP；设True则回到原版Prefix Tuning
+        inference_mode=False
     )
-    model_lora = get_peft_model(model, peft_config)
-    model_lora.print_trainable_parameters()  # 打印可训练参数
+    model_trained = get_peft_model(model, peft_config)
+    model_trained.config.use_cache = False      # 训练时不缓存 KV，省 ~100MB；generate 不受影响
+    model_trained.print_trainable_parameters()     # 打印可训练参数
 
-    training_args = TrainingArguments(
-        output_dir="./training/bert-base-uncased_Lora/output",
-        logging_dir="./training/bert-base-uncased_Lora/logs",
-        report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
-        logging_strategy="steps",
-        logging_steps=10,
-        # save_strategy="steps",
-        # save_steps=100,
-        save_strategy="epoch",
-        save_total_limit=3,
-        # eval_strategy="steps",        # 旧版本用这个，不要写evaluation_strategy
-        # eval_steps=100,
-        eval_strategy="epoch",
-        per_device_train_batch_size=4,   # 从8降到4，降低激活显存
-        per_device_eval_batch_size=8,    # eval也降
-        num_train_epochs=3,
-        learning_rate=5e-4,
-        bf16=True,
-        gradient_checkpointing=True,     # ✅开启梯度检查点，大幅降低激活显存，代价训练速度变慢
-        load_best_model_at_end=True,
-        # metric_for_best_model="f1",
-        metric_for_best_model="macro_f1",
-        weight_decay=0.01    
-    )
+training_args = TrainingArguments(
+    output_dir="./training/bert-base-uncased_PTuning-V2/output",
+    logging_dir="./training/bert-base-uncased_PTuning-V2/logs",
+    report_to="tensorboard",       # 显式指定：默认"all"会顺带探测wandb等集成；配合logging_dir查看曲线
+    logging_strategy="steps",
+    logging_steps=10,
+    # save_strategy="steps",
+    # save_steps=100,
+    save_strategy="epoch",
+    save_total_limit=3,
+    # eval_strategy="steps",        # 旧版本用这个，不要写evaluation_strategy
+    # eval_steps=100,
+    eval_strategy="epoch",
+    per_device_train_batch_size=4,   # 从8降到4，降低激活显存
+    per_device_eval_batch_size=8,    # eval也降
+    num_train_epochs=5,
+    learning_rate=1e-3,
+    bf16=True,
+    gradient_checkpointing=False,        # ★ v2必须关！gc把past_key_values置None → backward直接RuntimeError
+    load_best_model_at_end=True,
+    # metric_for_best_model="f1",
+    metric_for_best_model="macro_f1",
+    weight_decay=0.01    
+)
 
-    trainer = Trainer(
-        model=model_lora,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["validation"],
-        data_collator=data_collator,
-        processing_class=tokenizer,
-        compute_metrics=compute_metrics
-    )
+trainer = Trainer(
+    model=model_trained,
+    args=training_args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["validation"],
+    data_collator=data_collator,
+    processing_class=tokenizer,
+    compute_metrics=compute_metrics
+)
 
-
-# Lora微调
+# 微调
 if not has_adapter:
     trainer.train()
 
@@ -222,7 +217,7 @@ labels = predictions.label_ids
 print("混淆矩阵：\n", confusion_matrix(labels, preds))
 
 
-# ============ 保存LoRA适配器（关键代码） ============
+# ============ 保存P-TuningV2适配器（关键代码） ============
 if not has_adapter:
     # 保存LoRA权重、adapter配置，不保存BERT主干
     trainer.save_model(lora_save_path)

@@ -1,26 +1,16 @@
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
-
     TrainingArguments,
     Trainer
 )
 from datasets import load_dataset, DatasetDict
-import torch
+import evaluate as ev
+import torch, os
+
 
 # ===================== 加载模型 =====================
-# model_name = "Qwen/Qwen3-0.6B"
 model_path = "./model/Qwen3-0.6B" 
-
-# load the tokenizer and the model
-tokenizer = AutoTokenizer.from_pretrained(
-    model_path,
-    local_files_only=True  # 强制本地加载
-)
-# 新增
-tokenizer.pad_token = tokenizer.eos_token
-
 model = AutoModelForCausalLM.from_pretrained(
 #    model_name,
     model_path,
@@ -31,13 +21,14 @@ model = AutoModelForCausalLM.from_pretrained(
 
 print("模型加载成功！")
 
+
 # ===================== 加载数据集 =====================
 raw_datasets = load_dataset("./datasets/zhihu-kol/data")
 print("原始数据集：", raw_datasets)
 
-
 # 严格切分三份 train:80%  validation:10%  test:10%
 # 第一次切分：取出20%作为临时集，剩余80%为train
+raw_datasets["train"] = raw_datasets["train"].shuffle(seed=42).select(range(100))
 first_split = raw_datasets["train"].train_test_split(test_size=0.2, seed=42)
 ds_train = first_split["train"]
 temp_dataset = first_split["test"]
@@ -53,7 +44,7 @@ raw_datasets = DatasetDict({
 })
 
 print("切分完成：", raw_datasets)
-# train ~805k；validation ~100k；test ~100k
+# 采样后 train:80 validation:10 test:10
 
 # 索引取第0条样本，方括号 []，不是 ()
 sample = raw_datasets["train"][0]
@@ -64,20 +55,15 @@ print("回答：", sample["RESPONSE"])
 
 # ===================== 分词 =====================
 # tokenize函数（注意：这里还没有做labels mask，仅做分词
+# load the tokenizer and the model
+tokenizer = AutoTokenizer.from_pretrained(
+    model_path,
+    local_files_only=True  # 强制本地加载
+)
+# 新增
+tokenizer.pad_token = tokenizer.eos_token
+
 # batched=True，入参example是batch，字段值是list
-'''
-def tokenize_func(example):
-    texts = []
-    for ins, resp in zip(example["INSTRUCTION"], example["RESPONSE"]):
-        prompt = f"<|im_start|>user\n{ins}<|im_end|>\n<|im_start|>assistant\n{resp}<|im_end|>"
-        texts.append(prompt)
-    return tokenizer(
-        texts,
-        truncation=True,
-        max_length=4096,
-        padding="max_length"
-    )
-'''
 def tokenize_func(example):
     # full_texts：存放【完整对话】 user+assistant
     # user_parts：存放【仅用户prompt部分】，用来确定需要mask的token长度
@@ -97,7 +83,6 @@ def tokenize_func(example):
         user_parts.append(user_str)
 
     # 对完整文本做tokenize，得到input_ids、attention_mask；固定长度4096
-    # padding="max_length"：不足4096补pad；超过则截断
     tokenized_full = tokenizer(
         full_texts,
         truncation=True,
@@ -108,7 +93,7 @@ def tokenize_func(example):
 
     # 单独只对【用户prompt片段】做分词，得到用户部分的token数量 user_len
     # 不需要padding，只需要拿到真实token个数
-    tokenized_user = tokenizer(user_parts, truncation=True, max_length=4096)
+    tokenized_user = tokenizer(user_parts, truncation=True, max_length=1024)
 
     labels = []
     # 遍历batch中每一条样本的input_ids 和 用户部分tokenId
@@ -150,33 +135,132 @@ tokenized_datasets["test"] = raw_datasets["test"].map(
 
 print("分词后数据集：", tokenized_datasets)
 
-# ===================== 训练 =====================
+
+# ===================== 微调前基线评估（peft 包装前：原始 model）==========
+'''
 data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer,
-    mlm=False   # mlm=False 因果LM；True是bert掩码语言模型
+    mlm=False # 因果语言模型，不是掩码语言模型
+)
+'''
+
+# ⚠️ 不能用 DataCollatorForLanguageModeling，三个坑（详见 docs 第十二节）：
+#   ① tokenizer.pad 不填充 labels，eval批量>1时长度参差会崩
+#   ② mlm=False 分支用 input_ids 覆盖 labels，prompt=-100 的 mask 静默失效
+#   ③ labels==pad_token_id(即<|im_end|>)被改成-100，模型学不到停止符
+def custom_collate_fn(features):
+    """动态padding到batch内最长：input_ids补pad_token_id、attention_mask补0、labels补-100"""
+    max_len = max(len(f["input_ids"]) for f in features)
+    return {
+        "input_ids": torch.tensor(
+            [f["input_ids"] + [tokenizer.pad_token_id] * (max_len - len(f["input_ids"])) for f in features],
+            dtype=torch.long),
+        "attention_mask": torch.tensor(
+            [f["attention_mask"] + [0] * (max_len - len(f["attention_mask"])) for f in features],
+            dtype=torch.long),
+        "labels": torch.tensor(
+            [f["labels"] + [-100] * (max_len - len(f["labels"])) for f in features],
+            dtype=torch.long),
+    }
+
+data_collator = custom_collate_fn
+
+training_args_baseline = TrainingArguments(
+    output_dir="./training/qwen3-0.6b_SFT/output",
+    per_device_eval_batch_size=1,     # 与主 Trainer 一致（6G 卡 OOM 规避）
+    bf16=True,
+    do_train=False,
+    do_eval=True,
+    report_to="none",
 )
 
+trainer_baseline = Trainer(
+    model=model,                      # ← 原始 model，未包装
+    args=training_args_baseline,
+    eval_dataset=tokenized_datasets["validation"],
+    data_collator=data_collator,
+    processing_class=tokenizer,
+)
+
+# 固定同一批测试样本（微调前后必须完全一致）
+N_COMPARE = 5    # 验证集不足5条就调小
+test_instructions = [raw_datasets["validation"][i]["INSTRUCTION"] for i in range(N_COMPARE)]
+test_references   = [raw_datasets["validation"][i]["RESPONSE"]    for i in range(N_COMPARE)]
+
+# 微调前基线评估 + 生成对比准备,基线评估在下方按 has_adapter 分两种模式：
+# 训练模式 B=0≡base 直接评；加载模式 基线须在重载前评完
+def generate_answer(m, instruction, max_new_tokens=256):
+    """方案B核心：只用指令构造提示（不含答案！），greedy 解码保证前后对比可复现"""
+    user_str = f"<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
+    inputs = tokenizer(user_str, return_tensors="pt").to(m.device)
+    m.eval()   # 关掉 dropout(lora_dropout=0.1)，否则 train 模式下 greedy 也不可复现
+    with torch.no_grad():
+        output = m.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,     # greedy：同输入必同输出，前后对比才有效
+            temperature=1.0,     # ← 中性值，消除警告；贪心模式下无效参数
+            top_p=1.0,           # ←
+            top_k=50,            # ←
+            pad_token_id=tokenizer.pad_token_id
+        )
+    # generate 返回 = 提示原样在前 + 新生成在后；切掉提示只解码新生成部分
+    new_tokens = output[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(new_tokens, skip_special_tokens=False)
+
+print("==== 预训练模型原始基线 ====")
+baseline_eval = trainer_baseline.evaluate()
+print(baseline_eval)
+# 微调前基线生成（同样是 B=0 的模型在生成） 
+baseline_generations = [generate_answer(model, ins) for ins in test_instructions]
+print("基线生成完成")
+
+
+# ===================== 加载 =====================
+lora_save_path = "./training/qwen3-0.6b_SFT/lora_adapter"   # ← 从文件末尾上移到此处定义
+# 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
+has_adapter = os.path.exists(os.path.join(lora_save_path, "model.safetensors"))
+
+if has_adapter:
+    # ---------- 模式一：加载已训练的全量权重，跳过训练 ----------
+    print(f"检测到已保存的全量微调权重：{lora_save_path}，跳过训练")
+    # SFT没有adapter概念：直接from_pretrained重载整个微调后模型（config+tokenizer已随权重保存）
+    # 注意基线评估已在上方完成——全量微调覆盖了权重，无法像LoRA那样disable_adapter()切回base
+    del trainer_baseline, model          # 释放旧引用：否则旧base权重(~1.2G)仍被trainer_baseline.model
+                                         # 持有，重载后显存里同时存在两份0.6B模型
+    model = AutoModelForCausalLM.from_pretrained(
+        lora_save_path,
+        torch_dtype="auto",
+        local_files_only=True
+    )   # 重载后在CPU；下方主Trainer构造时会自动迁移到cuda，无需手动.to()
+else:
+    # ---------- 模式二：首次运行，保持当前 base model 直接进入训练 ----------
+    pass
+
+
+# ===================== 训练 =====================
 training_args = TrainingArguments(
     output_dir="./training/qwen3-0.6b_SFT/output",
     logging_dir="./training/qwen3-0.6b_SFT/logs",
     logging_strategy="steps",
     logging_steps=10,
-    save_strategy="steps",
-    save_steps=100,
+    # save_strategy="steps",
+    # save_steps=100,
+    save_strategy="epoch",
+    # eval_strategy="steps",
+    # eval_steps=200,
+    eval_strategy="epoch",    
+    learning_rate=2e-5,
     save_total_limit=3,
 
     # ========== OOM修复参数 ==========
-    per_device_train_batch_size=1,      # 6G卡，全量微调建议1；实在不行用 gradient_accumulation_steps
+    per_device_train_batch_size=1,       # 6G卡，全量微调建议1；实在不行用 gradient_accumulation_steps
     gradient_accumulation_steps=4,       # 梯度累积，模拟 bs=4
     per_device_eval_batch_size=1,
     gradient_checkpointing=True,         # ✅ 梯度检查点，大幅降低激活显存，速度会慢一点
-    fp16=True,                           # 开启fp16混合精度，不要用torch_dtype=auto带来的bf16；6G卡优先fp16
-    # bf16=False,
-
-    # 评估不要太频繁，eval也占显存
-    eval_strategy="steps",
-    eval_steps=200,
-
+    # fp16=True,                         # 开启fp16混合精度，不要用torch_dtype=auto带来的bf16；6G卡优先fp16
+    bf16=True,
+    
     # 显存碎片优化
     optim="adamw_torch_fused",
     report_to="tensorboard",       # 启用TensorBoard上报loss曲线，用法见 docs/TensorBoard查看loss曲线操作指导.md
@@ -191,33 +275,57 @@ trainer = Trainer(
     processing_class=tokenizer
 )
 
-
-print("开始 SFT 微调：")
-trainer.train()
+if not has_adapter:
+    print("开始 SFT 微调：")
+    trainer.train()
 
 
 # ===================== 评估 =====================
 print("开始评估：")
-metrics = trainer.evaluate(tokenized_datasets["validation"])
-print(metrics)
+# 微调后 eval_loss
+print("==== SFT 微调后 ====")
+after_eval = trainer.evaluate()
+print(after_eval)
+delta = (after_eval["eval_loss"] - baseline_eval["eval_loss"]) / baseline_eval["eval_loss"] * 100
+print(f"eval_loss 对比：{baseline_eval['eval_loss']:.4f} -> "
+      f"{after_eval['eval_loss']:.4f}（{delta:+.1f}%）")
 
-tokenizer.padding_side = "left" # generate必须left padding
+# 微调后生成同一批指令
+after_generations = [generate_answer(model, ins) for ins in test_instructions]
 
-def generate_sample(batch, idx=0):
-    input_ids = torch.tensor(batch["input_ids"][idx:idx+1]).to(model.device)
-    attention_mask = torch.tensor(batch["attention_mask"][idx:idx+1]).to(model.device)
-    outputs = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=256,
-        temperature=0.7,
-        top_p=0.9,
-        do_sample=True
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=False)
+# 前后对比打印 + 可选 ROUGE
+for i in range(N_COMPARE):
+    print(f"\n======== 样本 {i} ========")
+    print(f"【指令】{test_instructions[i]}")
+    print(f"【微调前 base】{baseline_generations[i]}")
+    print(f"【微调后 SFT】{after_generations[i]}")
+    ref = test_references[i]
+    print(f"【金标参考】{ref[:200]}{'...' if len(ref) > 200 else ''}")
 
-# 取validation前2条做生成演示，不要全量！
-for i in range(2):
-    text_out = generate_sample(tokenized_datasets["validation"], i)
-    print(f"==== sample {i} ====")
-    print(text_out)
+# （可选）ROUGE-L 定量对比。
+# 两个注意点：
+# ① vendored rouge 指标内部是英文分词（非 a-z0-9 字符全部过滤），中文直接算全为 0，
+#    必须逐字加空格"伪装"成英文词后再算（字符级 n-gram 粗略指标，仅看相对变化）；
+# ② 依赖 rouge_score / nltk 包，离线环境未安装会报错，try 包住可优雅跳过。
+try:
+    rouge = ev.load("./datasets/evaluate/metrics/rouge/rouge.py")
+    zh = lambda t: t.replace("<|im_end|>", "").replace("<|im_start|>", "").replace("<|endoftext|>", "").strip()
+    # ★ 字符级 tokenizer：按字符切分，绕开 rouge-score 的 [a-z0-9] 英文分词（对中文是必须的）
+    char_tok = lambda s: list(s)
+    kw = dict(rouge_types=["rougeL"], tokenizer=char_tok)
+    r_before = rouge.compute(predictions=[zh(g) for g in baseline_generations],
+                             references=[zh(r) for r in test_references], **kw)
+    r_after  = rouge.compute(predictions=[zh(g) for g in after_generations],
+                             references=[zh(r) for r in test_references], **kw)
+    print(f"ROUGE-L：微调前 {r_before['rougeL']:.4f} -> 微调后 {r_after['rougeL']:.4f}")
+except Exception as e:
+    print("ROUGE 计算跳过：", e)
+
+# ============ 保存全量微调权重（关键代码） ============
+if not has_adapter:
+    # SFT保存完整模型权重(~1.2GB bf16)——与LoRA只存adapter(几十MB)完全不同
+    trainer.save_model(lora_save_path)      # 同时保存config+tokenizer(因传了processing_class)
+    # 等价：model.save_pretrained(lora_save_path)
+    print(f"全量微调权重已保存至：{lora_save_path}")
+else:
+    print(f"已训练权重来自：{lora_save_path}（无需重复保存）")
