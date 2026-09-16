@@ -13,21 +13,21 @@
 
 ## 实验成果速览
 
-> 数字均为本地实测（80 条 zhihu 采样 / MRPC 全量），详细分析与踩坑过程见 docs 对应文档。
+> 数字均为本地实测（Qwen 线：zhihu-kol 采样 train 80 / val 10 / test 10；BERT 线：MRPC 全量）。**基线**：Qwen `eval_loss = 4.8659`（纯 base）、BERT `macro_f1 = 0.406`（随机分类头全预测多数类）。数值统一以磁盘现存 `checkpoint-*/trainer_state.json` 为准；详细分析与踩坑过程见 docs 对应文档与 [复盘总集](docs/大模型微调学习方案.md)。
 
 | 实验线 | 方法 | 状态 / 关键结论 | 详见 |
 |---|---|---|---|
-| Qwen | SFT | 已完成 | — |
-| Qwen | LoRA | eval_loss 4.8659 → 4.5211（**-7.1%**，3 epochs） | [LoRA 分析](docs/LoRA微调requires_grad错误分析与修复.md) |
-| Qwen | AdaLora | 调参后 4.8659 → 4.6509（-4.4%）；核心教训：**adapter 训练必须显式设 lr**，秩预算需回调驱动 `update_and_allocate` | [AdaLora 审查报告](docs/AdaLora微调代码审查报告.md) |
-| Qwen | QLoRA（4bit NF4） | 已跑通；权重显存 1.12→0.82 GiB；**QLoRA 线 eval_loss 与 LoRA 线不可横比**（量化底座不同） | [QLoRA 改造方案](docs/QLoRA微调改造方案.md) |
-| Qwen | Prompt Tuning | eval_loss 4.8659 → 4.3118（**-11.4%**，Qwen 线最佳），ROUGE-L 0.0174→0.0586（×3.4）；仅 16,384 可训练参数（0.0027%）；**lr=5e-3**（embedding 系需大步长） | [PromptTuning 检查报告](docs/PromptTuning实现检查报告.md) |
+| Qwen | SFT（全量） | eval_loss 4.8659 → **4.4278**（**-9.0%**）；产物为完整权重 1.19GB | — |
+| Qwen | LoRA | eval_loss 4.8659 → **4.5222**（**-7.1%**，3 epochs） | [LoRA 分析](docs/LoRA微调requires_grad错误分析与修复.md) |
+| Qwen | AdaLora | 调参后表观 4.8659 → 4.6509（-4.4%），**剥离关不掉的正交正则后 CE 4.6476（-4.5%）**；核心教训：**adapter 训练必须显式设 lr**，秩预算需回调驱动 `update_and_allocate` | [AdaLora 审查报告](docs/AdaLora微调代码审查报告.md) |
+| Qwen | QLoRA（4bit NF4） | 已跑通，4.8659 → 4.5212（**-7.1%**，与 LoRA 线相对幅度持平）；权重显存 1.12→0.82 GiB；**QLoRA 线 eval_loss 与 LoRA 线不可横比**（量化底座不同） | [QLoRA 改造方案](docs/QLoRA微调改造方案.md) |
+| Qwen | Prompt Tuning | eval_loss 4.8659 → **4.3326**（**-11.0%**，Qwen 线最佳）；仅 16,384 可训练参数（0.0027%）；**lr=5e-3**（embedding 系需大步长） | [PromptTuning 检查报告](docs/PromptTuning实现检查报告.md) |
 | Qwen | Prefix Tuning（重参数化） | eval_loss 4.8659 → 4.4212（**-9.1%**），无乱码；`prefix_projection=True` 是小数据下的**稳定性前提**（同配置关掉则 +119% 崩坏，见下行） | [PrefixTuning 报错分析](docs/PrefixTuning实现检查与报错分析.md) |
 | Qwen | P-Tuning v2（论文形态） | +119.4%/乱码——**封存为机制对照**，非 bug：v2 = peft 的 `PrefixTuningConfig(projection=False)`，去重参数化在小模型×小数据下不成立（论文前提是 300M~10B + 大数据） | [PTuningV2 检查报告](docs/PTuningV2实现检查报告.md) |
 | Qwen | 4bit NF4 推理 / vLLM 部署 | 已验证 / 脚本就绪（OpenAI 兼容服务） | — |
-| BERT | SFT / LoRA | 已完成 | [LoRA 分析](docs/LoRA微调requires_grad错误分析与修复.md) |
-| BERT | AdaLora | 2751 步训练完成（末轮 macro_f1≈0.80）；核心教训：`load_best_model_at_end` 与 AdaLora 的 rank_pattern 演化**不兼容**（size mismatch） | [AdaLora BERT 改造方案](docs/AdaLora微调BERT改造方案.md) |
-| BERT | P-Tuning v2 | 已完成（含全 1 退化解的定位与拯救，七组对照实验 E1-E7）；关键结论：**prompt 系参数 lr 需 1e-3 量级起步**（1e-4 会卡在"全预测多数类"退化解）；BERT+SEQ_CLS+PREFIX_TUNING 组合在本环境实测可用（修正了旧认知） | [PTuningV2-BERT 检查报告](docs/PTuningV2_BERT实现检查报告.md) |
+| BERT | SFT / LoRA | macro_f1 0.406 → **0.833** / **0.8225**（2751 步，几分钟跑完） | [LoRA 分析](docs/LoRA微调requires_grad错误分析与修复.md) |
+| BERT | AdaLora | 2751 步训练完成，macro_f1 0.406 → **0.7995**（ep2 峰值 0.8009）；核心教训：`load_best_model_at_end` 与 AdaLora 的 rank_pattern 演化**不兼容**（size mismatch） | [AdaLora BERT 改造方案](docs/AdaLora微调BERT改造方案.md) |
+| BERT | P-Tuning v2 | macro_f1 0.406 → **0.6731**（lr=1e-3、5 epoch，保 v2 纯度）；含全 1 退化解的定位与拯救，七组对照实验 E1-E7；关键结论：**prompt 系参数 lr 需 1e-3 量级起步**（1e-4 会卡在"全预测多数类"退化解），且**「重参数化 + 足够步长」两个必要条件缺一不可**；BERT+SEQ_CLS+PREFIX_TUNING 组合在本环境实测可用（修正了旧认知） | [PTuningV2-BERT 检查报告](docs/PTuningV2_BERT实现检查报告.md) |
 
 ## 学习成果与经验总结
 
@@ -63,7 +63,8 @@
 - **全 1 退化解检测器**：分类任务 `len(set(preds))==1` = "没学动"的硬信号，比 loss 曲线可靠（loss 微降可能只是偏置滑动）；BERT v2 线的定位即由此开始；
 - **归因靠对照实验，不靠猜测**：本仓库多次用"绕过 peft 原生注入""剂量曲线（prefix 长度 1→256）""linear probe 下限""同口径多配置对照（E1-E7）"把责任定位到方法/环境/数据层；
 - **跨方法复制脚本时，加载分支比训练分支更易踩雷**：`is_trainable` 三分规则——prompt learning **禁止传 True**（peft 直接 raise）；LoRA 系传了无意义（可删）；**AdaLora 必须传 True**（否则评估前向访问 `trainable_adapter_name` 崩溃）。同类坑：`trainer` 定义在 else 分支内导致二次运行 NameError；
-- 评估细节：`DataCollatorForLanguageModeling` 对 instruction 微调有三个坑（labels 不 pad / 覆盖 mask / 吃掉停止符），自定义 collator 解决；ROUGE 中文需逐字加空格"伪装"英文词。
+- 评估细节：`DataCollatorForLanguageModeling` 对 instruction 微调有**三个坑**（labels 不 pad → eval 批量>1 崩；无条件覆盖自定义 labels → `-100` mask 静默失效；`pad_token==eos` 时抹掉停止符监督 → 生成停不下来），**换自定义 collator 一次解决三个**；且 **collator 改动前后的 eval_loss 不可比**，对比要用同一套代码重跑；
+- **ROUGE 在中文上曾长期给出伪信号**：vendored `rouge-score` 的分词器只认 `[a-z0-9]`，对纯中文返回空列表（全 0、不报错）；而"逐字加空格伪装英文词"的 hack **对汉字同样无效**（汉字不在字符集里）。此前各线的"ROUGE 提升"实为 `<think>`、乱码拉丁词与参考里偶见数字的**碰巧重合**，与生成质量零相关。正确做法是给 `rouge.compute` 传字符级 tokenizer；**主指标请用 eval_loss（NLL 不经过分词）**。
 
 ### 5. 环境与工具
 
@@ -85,7 +86,7 @@
 .
 ├── test_*.py                    # 自包含实验/训练脚本（顶层顺序执行，非 pytest 测试）
 ├── CLAUDE.md                    # AI 助手项目配置（含架构约定与踩坑记录，亦可作项目说明阅读）
-├── docs/                        # 规划 + 各实验线的踩坑/方案文档（见文末索引）
+├── docs/                        # 总复盘 + 各实验线的踩坑/方案文档（见文末索引）
 ├── model/                       # ❌ 不进 git：本地 HF 模型权重（约 5G）
 ├── datasets/
 │   ├── evaluate/                # ✅ 进 git：vendored 的 HF evaluate 库源码（脚本依赖其本地路径加载指标）
@@ -211,8 +212,9 @@ git push -u origin main         # -u 建立跟踪关系，之后可省略 origin
 
 ## 更多文档
 
-**规划**
-- 实验总体规划：[docs/大模型微调学习方案.md](docs/大模型微调学习方案.md)
+**规划与总复盘（建议先读这篇）**
+- 实验总体规划 + 全部实验复盘 + 35 条踩坑总集 + 排障工具箱：[docs/大模型微调学习方案.md](docs/大模型微调学习方案.md)
+  —— 含「预判 vs 实测」逐条对照：原方案里"peft 不支持 CausalLM 做 prompt 系""BERT 不能用 peft 的 PrefixTuningConfig""P-Tuning v2 需要第三方实现"等旧认知**均被实测证伪**。
 
 **Qwen 线（生成）**
 - LoRA 线踩坑全集（requires_grad / collator / 评估方法 / 复用模式基线陷阱）：[docs/LoRA微调requires_grad错误分析与修复.md](docs/LoRA微调requires_grad错误分析与修复.md)

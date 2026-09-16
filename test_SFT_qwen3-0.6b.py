@@ -15,12 +15,12 @@ model = AutoModelForCausalLM.from_pretrained(
 #    model_name,
     model_path,
     torch_dtype="auto",
-    # device_map="auto",  # ❗删掉这一行！Trainer会自动迁移model到device
+    device_map="auto",
     local_files_only=True
 )
 
 print("模型加载成功！")
-
+print(model)
 
 # ===================== 加载数据集 =====================
 raw_datasets = load_dataset("./datasets/zhihu-kol/data")

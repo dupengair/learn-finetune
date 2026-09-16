@@ -330,12 +330,16 @@ for i in range(N_COMPARE):
 # ① vendored rouge 指标内部是英文分词（非 a-z0-9 字符全部过滤），中文直接算全为 0，
 #    必须逐字加空格"伪装"成英文词后再算（字符级 n-gram 粗略指标，仅看相对变化）；
 # ② 依赖 rouge_score / nltk 包，离线环境未安装会报错，try 包住可优雅跳过。
-try:    
+try:
     rouge = ev.load("./datasets/evaluate/metrics/rouge/rouge.py")
-    # zh = lambda texts: [" ".join(t) for t in texts]   # 中文逐字切开
-    zh = lambda texts: [" ".join(t.replace("<|im_end|>", "").replace("<|im_start|>", "").replace("<|endoftext|>", "")) for t in texts]
-    r_before = rouge.compute(predictions=zh(baseline_generations), references=zh(test_references))
-    r_after  = rouge.compute(predictions=zh(after_generations),  references=zh(test_references))
+    zh = lambda t: t.replace("<|im_end|>", "").replace("<|im_start|>", "").replace("<|endoftext|>", "").strip()
+    # ★ 字符级 tokenizer：按字符切分，绕开 rouge-score 的 [a-z0-9] 英文分词（对中文是必须的）
+    char_tok = lambda s: list(s)
+    kw = dict(rouge_types=["rougeL"], tokenizer=char_tok)
+    r_before = rouge.compute(predictions=[zh(g) for g in baseline_generations],
+                             references=[zh(r) for r in test_references], **kw)
+    r_after  = rouge.compute(predictions=[zh(g) for g in after_generations],
+                             references=[zh(r) for r in test_references], **kw)
     print(f"ROUGE-L：微调前 {r_before['rougeL']:.4f} -> 微调后 {r_after['rougeL']:.4f}")
 except Exception as e:
     print("ROUGE 计算跳过：", e)
