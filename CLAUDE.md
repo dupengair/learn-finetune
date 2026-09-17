@@ -34,7 +34,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `test_Lora_qwen3-0.6b.py` / `test_Lora_bert.py` | LoRA 微调（peft），先跑训练前基线评估 |
 | `test_Lora-load_bert.py` | 从 `training/.../lora_adapter` 加载适配器推理 |
 | `test_AdaLora_qwen3-0.6b.py` / `test_AdaLora_bert.py` | AdaLora：秩预算需回调驱动 `update_and_allocate`；加载必须 `is_trainable=True`（见坑 4） |
-| `test_QLora_qwen3-0.6b.py` | QLoRA：4bit NF4 + `prepare_model_for_kbit_training` + paged 优化器 |
+| `test_QLora_qwen3-0.6b.py` | QLoRA：4bit NF4 + `prepare_model_for_kbit_training` + paged 优化器。量化缺失与基线 Trainer 报错两层问题均已解决（2026-09-17，见 docs/QLoRA微调改造方案.md 第六/八节）：**peft 包装先于基线评估，基线用 `with model_lora.disable_adapter():` 拿纯 4bit base 口径**（纯量化模型不能直接构造 Trainer，见坑 19）。实测 4.9813 → 4.6469（-6.7%） |
 | `test_Prefix_qwen3-0.6b.py` | Prefix Tuning **原版论文形态**（`prefix_projection=True`，每层 KV 注入，效果线） |
 | `test_Prompt_qwen3-0.6b.py` | Prompt Tuning（TEXT 初始化虚拟 embedding，lr=5e-3） |
 | `test_PTuningV2_qwen3-0.6b.py` | P-Tuning v2 论文形态（`prefix_projection=False`，机制对照线，小数据下崩坏属预期） |
@@ -88,3 +88,4 @@ SFT 数据流程是固定管线：加载 → **`.shuffle(seed=42).select(range(1
 16. **采样后全程只有几十~两百步，`steps` 类阈值会集体失效**：`eval_steps`/`save_steps` 按旧全量口径设的值可能一次都不触发（表现为**训练全程零 eval、零 checkpoint、TensorBoard 空白**），`logging_steps` 默认 500 更是一条 train_loss 都不记。**用 `eval_strategy="epoch"` + `save_strategy="epoch"` + 显式 `logging_steps=10`。**
 17. **遗留的注释错误（改动这两个脚本时顺手清理）**：`test_Lora_bert.py:142-144` 与 `test_PTuningV2_bert.py:143-145` 的加载分支里，留着从 AdaLora 复制来的"★ `is_trainable=True` 必须…"注释，但两处代码都已不传该参数。**对 `test_PTuningV2_bert.py` 而言，照注释加回去会直接 `ValueError` 崩**（prompt learning 禁止 True，见坑 4）。
 18. 代码注释和文档均为中文，新增注释保持中文。**注释要随代码同步改**——本仓库最贵的几个坑（坑 3、坑 7、坑 17）都源于"注释与代码相反"，对学习型仓库来说，错误注释比错误代码危害更大。
+19. **纯量化模型不能直接构造 Trainer（QLoRA 专属，已踩实）**：`Trainer.__init__` 拦截"is_quantized + 未挂 adapter"的模型并 raise `ValueError: purely quantized models`，**不看 `do_train=False`**（只想做基线评估也被拦）。因此 QLoRA 线的 peft 包装必须**先于**基线评估，基线在 `with model_lora.disable_adapter():` 内 evaluate/generate（= 纯 4bit base 口径）。附带认知：这个报错出现说明量化已生效——它是"量化修复成功"的信号而非倒退。修复三步见 docs/QLoRA微调改造方案.md 第八节。

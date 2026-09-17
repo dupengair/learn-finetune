@@ -20,7 +20,7 @@
 | Qwen | SFT（全量） | eval_loss 4.8659 → **4.4278**（**-9.0%**）；产物为完整权重 1.19GB | — |
 | Qwen | LoRA | eval_loss 4.8659 → **4.5222**（**-7.1%**，3 epochs） | [LoRA 分析](docs/LoRA微调requires_grad错误分析与修复.md) |
 | Qwen | AdaLora | 调参后表观 4.8659 → 4.6509（-4.4%），**剥离关不掉的正交正则后 CE 4.6476（-4.5%）**；核心教训：**adapter 训练必须显式设 lr**，秩预算需回调驱动 `update_and_allocate` | [AdaLora 审查报告](docs/AdaLora微调代码审查报告.md) |
-| Qwen | QLoRA（4bit NF4） | 已跑通，4.8659 → 4.5212（**-7.1%**，与 LoRA 线相对幅度持平）；权重显存 1.12→0.82 GiB；**QLoRA 线 eval_loss 与 LoRA 线不可横比**（量化底座不同） | [QLoRA 改造方案](docs/QLoRA微调改造方案.md) |
+| Qwen | QLoRA（4bit NF4） | **量化版已跑通（2026-09-17）**：4bit base 基线 **4.9813** → 4.6469（**-6.7%**）；量化噪声实测 **+0.115 NLL（+2.4%）** vs bf16 基线 4.8659；相对增益与 LoRA 线 -7.1% 基本持平（跨底座绝对值不可横比）。此前的量化缺失 bug 与基线 Trainer 报错的完整修复链见改造方案第六/八/九节 | [QLoRA 改造方案](docs/QLoRA微调改造方案.md) |
 | Qwen | Prompt Tuning | eval_loss 4.8659 → **4.3326**（**-11.0%**，Qwen 线最佳）；仅 16,384 可训练参数（0.0027%）；**lr=5e-3**（embedding 系需大步长） | [PromptTuning 检查报告](docs/PromptTuning实现检查报告.md) |
 | Qwen | Prefix Tuning（重参数化） | eval_loss 4.8659 → 4.4212（**-9.1%**），无乱码；`prefix_projection=True` 是小数据下的**稳定性前提**（同配置关掉则 +119% 崩坏，见下行） | [PrefixTuning 报错分析](docs/PrefixTuning实现检查与报错分析.md) |
 | Qwen | P-Tuning v2（论文形态） | +119.4%/乱码——**封存为机制对照**，非 bug：v2 = peft 的 `PrefixTuningConfig(projection=False)`，去重参数化在小模型×小数据下不成立（论文前提是 300M~10B + 大数据） | [PTuningV2 检查报告](docs/PTuningV2实现检查报告.md) |

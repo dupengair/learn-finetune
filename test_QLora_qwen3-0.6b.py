@@ -32,8 +32,9 @@ bnb_config = BitsAndBytesConfig(
 
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
+    quantization_config=bnb_config,     # ★ 补上这一行——bnb_config 从"死代码"变成生效配置
     torch_dtype="auto",
-    device_map="auto",      # ★ QLoRA 必须保留：量化模型必须放 GPU
+    device_map="auto",                  # ★ QLoRA 必须保留：量化模型必须放 GPU
     local_files_only=True
 )
 
@@ -153,7 +154,55 @@ tokenized_datasets["test"] = raw_datasets["test"].map(
 print("分词后数据集：", tokenized_datasets)
 
 
-# ===================== 微调前基线评估（peft 包装前：原始 model）==========
+# ===================== 加载（上移：基线评估之前） =====================
+lora_save_path = "./training/qwen3-0.6b_QLora/lora_adapter"   # ← 从文件末尾上移到此处定义
+# 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
+has_adapter = os.path.exists(os.path.join(lora_save_path, "adapter_config.json"))
+
+# peft 包装（顶格：两种模式各自构造 model_lora）
+# ★ 量化模型不能直接构造 Trainer（transformers 检查 is_quantized + 未挂 adapter，
+#   见 QLoRA 文档 8.2），基线改用 disable_adapter()，故包装必须先于基线评估
+if has_adapter:
+    # ---------- 模式一：加载已训练权重，跳过训练 ----------
+    print(f"检测到已保存的QLoRA适配器：{lora_save_path}，跳过训练")
+    model_lora = PeftModel.from_pretrained(model, lora_save_path)
+    # 默认 is_trainable=False：适配器权重 requires_grad=False，仅推理/评估
+    # 此时 print_trainable_parameters 会显示 0% 可训练——这是预期的
+    model_lora.print_trainable_parameters()
+else:
+    # ---------- 模式二：首次运行，完整训练流程 ----------
+    peft_config = LoraConfig(
+        task_type = TaskType.CAUSAL_LM,    
+        inference_mode = False,   
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        bias = "none",
+        r = 8,    
+        lora_alpha = 16,                 # 一般为2r    
+        lora_dropout = 0.1               # 防止过拟合
+    )
+    # ★ QLoRA 标准协议（peft 0.18.1 源码核实的三件事）：
+    #   ① 冻结全部 base 参数
+    #   ② 把所有非量化的 bf16/fp16 参数 cast 成 fp32（norm 层数值稳定性）
+    #   ③ enable_input_require_grads + gradient_checkpointing_enable
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},   # 沿用原脚本的显式设置
+    )
+    model_lora = get_peft_model(model, peft_config)
+    # model_lora.enable_input_require_grads()   # ← 删除：prepare 内部已做，重复无益
+    model_lora.print_trainable_parameters()  # 打印可训练参数
+
+
+# ===================== 微调前基线评估（包装后 + disable_adapter）==========
 '''
 data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer,
@@ -192,7 +241,7 @@ training_args_baseline = TrainingArguments(
 )
 
 trainer_baseline = Trainer(
-    model=model,                      # ← 原始 model，未包装
+    model=model_lora,                 # ← 改：裸量化 model → 挂了 adapter 的 PeftModel（满足 8.2 检查）
     args=training_args_baseline,
     eval_dataset=tokenized_datasets["validation"],
     data_collator=data_collator,
@@ -204,8 +253,7 @@ N_COMPARE = 5    # 验证集不足5条就调小
 test_instructions = [raw_datasets["validation"][i]["INSTRUCTION"] for i in range(N_COMPARE)]
 test_references   = [raw_datasets["validation"][i]["RESPONSE"]    for i in range(N_COMPARE)]
 
-# 微调前基线评估 + 生成对比准备,基线评估在下方按 has_adapter 分两种模式：
-# 训练模式 B=0≡base 直接评；加载模式用 disable_adapter() 切回 base
+# 微调前基线评估 + 生成对比准备：两种模式统一用 disable_adapter() 切到纯 4bit base
 def generate_answer(m, instruction, max_new_tokens=256):
     """方案B核心：只用指令构造提示（不含答案！），greedy 解码保证前后对比可复现"""
     user_str = f"<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
@@ -225,57 +273,13 @@ def generate_answer(m, instruction, max_new_tokens=256):
     new_tokens = output[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=False)
 
-print("==== 预训练模型原始基线 ====")
-baseline_eval = trainer_baseline.evaluate()
-print(baseline_eval)
-# 微调前基线生成（同样是 B=0 的模型在生成） 
-baseline_generations = [generate_answer(model, ins) for ins in test_instructions]
-print("基线生成完成")
-
-
-# ===================== 加载 =====================
-lora_save_path = "./training/qwen3-0.6b_QLora/lora_adapter"   # ← 从文件末尾上移到此处定义
-# 判断"保存完成"：adapter_config.json 存在（只看目录会误判保存中断的残缺目录）
-has_adapter = os.path.exists(os.path.join(lora_save_path, "adapter_config.json"))
-
-if has_adapter:
-    # ---------- 模式一：加载已训练权重，跳过训练 ----------
-    print(f"检测到已保存的LoRA适配器：{lora_save_path}，跳过训练")
-    model_lora = PeftModel.from_pretrained(model, lora_save_path)
-    # 默认 is_trainable=False：适配器权重 requires_grad=False，仅推理/评估
-    # 此时 print_trainable_parameters 会显示 0% 可训练——这是预期的
-    model_lora.print_trainable_parameters()
-else:
-    # ---------- 模式二：首次运行，完整训练流程 ----------
-    peft_config = LoraConfig(
-        task_type = TaskType.CAUSAL_LM,    
-        inference_mode = False,   
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        bias = "none",
-        r = 8,    
-        lora_alpha = 16,                 # 一般为2r    
-        lora_dropout = 0.1               # 防止过拟合
-    )
-    # ★ QLoRA 标准协议（peft 0.18.1 源码核实的三件事）：
-    #   ① 冻结全部 base 参数
-    #   ② 把所有非量化的 bf16/fp16 参数 cast 成 fp32（norm 层数值稳定性）
-    #   ③ enable_input_require_grads + gradient_checkpointing_enable
-    model = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},   # 沿用原脚本的显式设置
-    )
-    model_lora = get_peft_model(model, peft_config)
-    # model_lora.enable_input_require_grads()   # ← 删除：prepare 内部已做，重复无益
-    model_lora.print_trainable_parameters()  # 打印可训练参数
+with model_lora.disable_adapter():     # ← 基线 = 纯 4bit base（adapter 输出置零，ΔW=B·A=0）
+    print("==== 预训练模型原始基线（纯 4bit base 口径）====")
+    baseline_eval = trainer_baseline.evaluate()
+    print(baseline_eval)
+    # 微调前基线生成（同样是 B=0 的模型在生成） 
+    baseline_generations = [generate_answer(model_lora, ins) for ins in test_instructions]
+    print("基线生成完成")
 
 
 # ===================== 训练 =====================
